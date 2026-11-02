@@ -1,0 +1,93 @@
+name: Refresh public tender snapshot
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 8,16 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: public-snapshot
+  cancel-in-progress: false
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - run: pip install requests==2.32.5 beautifulsoup4==4.14.2
+      - name: Collect public source only
+        run: |
+          python - <<'PY'
+          """Public-source-only snapshot generator. No credentials or private database."""
+          import json, re, time
+          from datetime import datetime, timezone
+          from urllib.parse import urljoin, urlsplit
+          import requests
+          from bs4 import BeautifulSoup
+          BASE = 'https://www.imc-egypt.org'
+          SOURCE = BASE + '/ar/public-tenders.html'
+          s = requests.Session()
+          s.headers['User-Agent'] = 'IMC-Public-Dashboard/1.0'
+          def page(url):
+              r = s.get(url, timeout=(10, 30)); r.raise_for_status()
+              if urlsplit(r.url).hostname != 'www.imc-egypt.org': raise ValueError('Unexpected host')
+              r.encoding = 'utf-8'
+              return BeautifulSoup(r.text, 'html.parser')
+          def normal(t):
+              return re.sub(r'\s+', ' ', t.translate(str.maketrans('أإآى','اااي'))).lower()
+          listing = page(SOURCE)
+          urls = {urljoin(SOURCE,a['href']) for a in listing.select('a[href]') if re.match(r'^https://www\.imc-egypt\.org/ar/public-tenders/item/\d+', urljoin(SOURCE,a['href']))}
+          urls = sorted(urls, key=lambda u:int(re.search(r'/item/(\d+)',u)[1]), reverse=True)[:30]
+          items=[]
+          for url in urls:
+              soup=page(url)
+              title=soup.select_one('.itemTitle') or soup.find('h1') or soup.find('h2')
+              text=soup.select_one('.itemFullText') or soup.select_one('.itemIntroText')
+              body=text.get_text(' ',strip=True) if text else ''
+              title=title.get_text(' ',strip=True) if title else 'Tender notice'
+              norm=normal(title+' '+body)
+              category='Other'
+              for label, pattern in [('Odoo',r'\bodoo\b|(?<!\w)اودو(?!\w)'),('ERP',r'\berp\b|enterprise resource planning|تخطيط موارد'),('Software',r'\bsoftware\b|برمجيات|تطوير (?:نظام|تطبيق|برنامج)')]:
+                  if re.search(pattern,norm): category=label;break
+              dates=soup.select_one('.itemDateCreated')
+              published=dates.get_text(' ',strip=True) if dates else ''
+              excerpts=re.findall(r'(?:قبل يوم|اخر موعد|آخر موعد|الموعد النهائي|deadline|closing date)[^\n]{0,200}',body,re.I)
+              # Allowlist only public title, date, source URL and deadline wording. No bodies, contacts or attachments.
+              items.append({'id':re.search(r'/item/(\d+)',url)[1], 'title':title,'url':url,'published':published,'category':category,'deadline':' | '.join(excerpts[:2])})
+              time.sleep(.25)
+          if not items: raise RuntimeError('No tenders: refusing to replace snapshot')
+          with open('data.json','w',encoding='utf-8') as f: json.dump({'checked_at':datetime.now(timezone.utc).isoformat(),'source':SOURCE,'coverage':'Latest 30 tender notices by source item ID, not the complete archive.','items':items},f,ensure_ascii=False,indent=2)
+          print('Public snapshot saved:',len(items),'notices')
+          
+          from pathlib import Path
+          html = Path('index.html').read_text()
+          data = Path('data.json').read_text().replace('</', '<\\/')
+          assert not re.search(r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}', data), 'Contact data refused'
+          html, count = re.subn(r'(<script id="snapshot" type="application/json">).*?(</script>)', lambda m: m[1] + data + m[2], html, count=1, flags=re.S)
+          assert count == 1
+          Path('index.html').write_text(html)
+          PY
+      - name: Save successful snapshot
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add index.html
+          git diff --cached --quiet || git commit -m "Refresh public tender snapshot"
+          git push
+      - name: Prepare public site only
+        run: mkdir _site && cp index.html _site/
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
+        with:
+          path: _site
+      - uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346
+        id: deployment
