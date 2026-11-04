@@ -15,7 +15,7 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -26,10 +26,17 @@ jobs:
           python-version: '3.12'
       - run: pip install requests==2.32.5 beautifulsoup4==4.14.2
       - name: Collect public source only
+        id: collect
         run: |
           python - <<'PY'
-          """Public-source-only snapshot generator. No credentials or private database."""
-          import json, re, time
+          """Public-source-only snapshot generator. No credentials or private database.
+
+          Outage-safe: fetches are retried, an unreachable source or thin result never
+          replaces the last good snapshot, and on outage the step reports
+          source_ok=false so the run still fails honestly after the unchanged
+          snapshot is redeployed.
+          """
+          import json, os, re, sys, time
           from datetime import datetime, timezone
           from urllib.parse import urljoin, urlsplit
           import requests
@@ -38,19 +45,47 @@ jobs:
           SOURCE = BASE + '/ar/public-tenders.html'
           s = requests.Session()
           s.headers['User-Agent'] = 'IMC-Public-Dashboard/1.0'
-          def page(url):
-              r = s.get(url, timeout=(10, 30)); r.raise_for_status()
-              if urlsplit(r.url).hostname != 'www.imc-egypt.org': raise ValueError('Unexpected host')
-              r.encoding = 'utf-8'
-              return BeautifulSoup(r.text, 'html.parser')
+          def page(url, attempts=3, base_wait=15):
+              last = None
+              for i in range(attempts):
+                  try:
+                      r = s.get(url, timeout=(10, 30)); r.raise_for_status()
+                      if urlsplit(r.url).hostname != 'www.imc-egypt.org': raise ValueError('Unexpected host')
+                      r.encoding = 'utf-8'
+                      return BeautifulSoup(r.text, 'html.parser')
+                  except Exception as e:
+                      last = e
+                      print(f'attempt {i+1}/{attempts} failed for {url}: {type(e).__name__}: {e}', flush=True)
+                      if i + 1 < attempts: time.sleep(base_wait * (i + 1))
+              raise last
           def normal(t):
               return re.sub(r'\s+', ' ', t.translate(str.maketrans('أإآى','اااي'))).lower()
-          listing = page(SOURCE)
+          def outage(reason):
+              print(f'::warning title=IMC source unreachable::{reason}', flush=True)
+              summary = os.environ.get('GITHUB_STEP_SUMMARY')
+              if summary:
+                  with open(summary, 'a', encoding='utf-8') as f:
+                      f.write('## IMC source unreachable\n\n' + reason + '\n\nThe last good published snapshot was kept unchanged. The next scheduled run retries automatically.\n')
+              out = os.environ.get('GITHUB_OUTPUT')
+              if out:
+                  with open(out, 'a', encoding='utf-8') as f: f.write('source_ok=false\n')
+              sys.exit(0)
+          try:
+              listing = page(SOURCE)
+          except Exception as e:
+              outage(f'Could not fetch {SOURCE} after retries: {type(e).__name__}: {e}')
           urls = {urljoin(SOURCE,a['href']) for a in listing.select('a[href]') if re.match(r'^https://www\.imc-egypt\.org/ar/public-tenders/item/\d+', urljoin(SOURCE,a['href']))}
           urls = sorted(urls, key=lambda u:int(re.search(r'/item/(\d+)',u)[1]), reverse=True)[:30]
-          items=[]
+          if not urls: outage(f'Listing at {SOURCE} loaded but contained no tender links; the page layout may have changed.')
+          items=[]; failed=0
           for url in urls:
-              soup=page(url)
+              try:
+                  soup=page(url, attempts=2, base_wait=10)
+              except Exception as e:
+                  failed += 1
+                  print(f'skipping {url}: {type(e).__name__}: {e}', flush=True)
+                  if failed >= 5: outage(f'{failed} tender pages failed to load; treating as a source outage.')
+                  continue
               title=soup.select_one('.itemTitle') or soup.find('h1') or soup.find('h2')
               text=soup.select_one('.itemFullText') or soup.select_one('.itemIntroText')
               body=text.get_text(' ',strip=True) if text else ''
@@ -65,10 +100,11 @@ jobs:
               # Allowlist only public title, date, source URL and deadline wording. No bodies, contacts or attachments.
               items.append({'id':re.search(r'/item/(\d+)',url)[1], 'title':title,'url':url,'published':published,'category':category,'deadline':' | '.join(excerpts[:2])})
               time.sleep(.25)
-          if not items: raise RuntimeError('No tenders: refusing to replace snapshot')
+          if len(items) < min(10, len(urls)):
+              outage(f'Only {len(items)} of {len(urls)} tender notices could be collected; refusing to replace the snapshot with thin data.')
           with open('data.json','w',encoding='utf-8') as f: json.dump({'checked_at':datetime.now(timezone.utc).isoformat(),'source':SOURCE,'coverage':'Latest 30 tender notices by source item ID, not the complete archive.','items':items},f,ensure_ascii=False,indent=2)
           print('Public snapshot saved:',len(items),'notices')
-          
+
           from pathlib import Path
           html = Path('index.html').read_text()
           data = Path('data.json').read_text().replace('</', '<\\/')
@@ -76,8 +112,12 @@ jobs:
           html, count = re.subn(r'(<script id="snapshot" type="application/json">).*?(</script>)', lambda m: m[1] + data + m[2], html, count=1, flags=re.S)
           assert count == 1
           Path('index.html').write_text(html)
+          out = os.environ.get('GITHUB_OUTPUT')
+          if out:
+              with open(out, 'a', encoding='utf-8') as f: f.write('source_ok=true\n')
           PY
       - name: Save successful snapshot
+        if: steps.collect.outputs.source_ok == 'true'
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
@@ -85,9 +125,15 @@ jobs:
           git diff --cached --quiet || git commit -m "Refresh public tender snapshot"
           git push
       - name: Prepare public site only
+        if: always()
         run: mkdir _site && cp index.html _site/
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
+        if: always()
         with:
           path: _site
       - uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346
+        if: always()
         id: deployment
+      - name: Report source outage
+        if: steps.collect.outputs.source_ok == 'false'
+        run: exit 1
